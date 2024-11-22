@@ -1,4 +1,4 @@
-# NLU-Project
+# Continual Learning for LLMs
 
 ## Setting Up the Environment
 (I am assuming that you have anaconda installed, if not please install it.)
