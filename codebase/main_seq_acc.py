@@ -121,33 +121,30 @@ if __name__ == '__main__':
                                                                                     for task_name, task_valid_data in sequential_valid_data.items()} 
     
     all_rouge_score_stats = {}
+    lora_past_A_matrices = {}
+    lora_past_B_matrices = {}
+
     for i, (train_task_name, train_dataloader) in enumerate(train_dataloaders.items()):
         if accelerator.is_main_process:
             logger.info("===============================================================================")
             logger.info("*******************************************************************************")
             logger.info("Training with task: %s"%train_task_name)
-            logger.info("Dataset length: %d"%len(train_dataloader.dataset))
             logger.info("*******************************************************************************")
             logger.info("===============================================================================")
 
         if args.lora_target_modules:
-            peft_config = LoraConfig( task_type=TaskType.CAUSAL_LM, inference_mode=False, bias = "none", target_modules=args.lora_target_modules,
-                r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, fan_in_fan_out = args.lora_fan_in_fan_out  )
+            peft_config = LoraConfig( task_type=TaskType.CAUSAL_LM, inference_mode=False, bias="none",
+                target_modules=args.lora_target_modules, r=args.lora_r, lora_alpha=args.lora_alpha, 
+                lora_dropout=args.lora_dropout, fan_in_fan_out=args.lora_fan_in_fan_out)
         else:
-            peft_config = LoraConfig( task_type=TaskType.CAUSAL_LM, inference_mode=False, bias = "none",
-                                        r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, fan_in_fan_out = args.lora_fan_in_fan_out  )
+            peft_config = LoraConfig( task_type=TaskType.CAUSAL_LM, inference_mode=False, bias="none",
+                r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, 
+                fan_in_fan_out=args.lora_fan_in_fan_out)
+        
         model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
 
         optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.wd)
         model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
-
-        if accelerator.is_main_process:
-            logger.info("Listing the trainable layers:")
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    print(name)
-                    logger.info(name)
 
         num_update_steps_per_epoch = len(train_dataloader)
         num_training_steps = args.train_epochs * num_update_steps_per_epoch
@@ -156,14 +153,14 @@ if __name__ == '__main__':
                                         optimizer=optimizer,
                                         num_warmup_steps=num_warmup_steps,
                                         num_training_steps=num_training_steps)
-           
 
         rouge_score_records = {}
         rouge_score = evaluate.load("rouge")
+
         for epoch in range(1, args.train_epochs+1):
-            
             rouge_score_records[epoch] = []
             train_loss = train(model, train_dataloader, optimizer, lr_scheduler, accelerator)
+            
             if accelerator.is_main_process:
                 logger.info("EPOCH: %d"%epoch)
                 logger.info("Train loss = %f"%train_loss)
@@ -172,7 +169,7 @@ if __name__ == '__main__':
             for task_name, valid_dataloader in valid_dataloaders.items():
                 val_loss, result = validate(model, valid_dataloader, rouge_score, accelerator.device)
                 rouge_score_records[epoch].append({task_name: result})
-                # Collecting validation ROUGE scores and reporting stats
+
                 if accelerator.is_main_process:
                     logger.info("-----------------------------------------------------")
                     logger.info(task_name)
@@ -180,34 +177,47 @@ if __name__ == '__main__':
                     logger.info(result)
                     logger.info("Valid loss = %f"%val_loss)
                     logger.info("======================================================")
+        
         if accelerator.is_main_process:
             logger.info("======================= SUMMARY =======================")
             logger.info(rouge_score_records)
         all_rouge_score_stats[train_task_name] = rouge_score_records
-        
 
         accelerator.wait_for_everyone()
+
+        # **Store LoRA A and B matrices before merging**
+        lora_past_A_matrices[train_task_name] = {k: param.to("cpu") for k, param in model.named_parameters() if "lora_A" in k}
+        lora_past_B_matrices[train_task_name] = {k: param.to("cpu") for k, param in model.named_parameters() if "lora_B" in k}
+
+        if accelerator.is_main_process:
+            logger.info(f"Stored LoRA A and B matrices for task {train_task_name}")
+
+        # **Clear previous optimizer and model states**
         model = accelerator.unwrap_model(model)
         accelerator.clear()
-        # state._reset_state()
         del optimizer, lr_scheduler, train_dataloader
         torch.cuda.empty_cache()
 
-        # Saving the LoRA_A adapters of the current task
+        # **Merge and Unload LoRA**
         for param in model.parameters():
             param.requires_grad = False
-        # Merging the current task LoRA layers to the model and removing the lora components.
         model = model.merge_and_unload()
 
+        # **Save final model checkpoint if needed**
         if args.save_model:
-            save_name = os.path.join(args.experiment_dir,'model_params_after_task%d'%i)
-            model.save_pretrained(save_name, from_pt=True) 
+            save_name = os.path.join(args.experiment_dir, f'model_params_after_task{i}')
+            model.save_pretrained(save_name, from_pt=True)
 
+    # **Save all LoRA A and B matrices after training**
+    torch.save(lora_past_A_matrices, os.path.join(args.experiment_dir, "lora_A_matrices.pt"))
+    torch.save(lora_past_B_matrices, os.path.join(args.experiment_dir, "lora_B_matrices.pt"))
     if args.print_generations:
         for task_name, valid_dataloader in valid_dataloaders.items():
             if accelerator.is_main_process:
                 logger.info(task_name)
                 get_generations_on_dataloader(model, tokenizer, valid_dataloader, accelerator.device)
 
+
     with open(os.path.join(args.experiment_dir,'experiment_results.pickle'), 'wb') as handle:
         pickle.dump(all_rouge_score_stats, handle, protocol=pickle.HIGHEST_PROTOCOL)
+

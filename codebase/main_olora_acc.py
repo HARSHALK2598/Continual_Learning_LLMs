@@ -47,35 +47,42 @@ def orthogonal_lora_loss(model, past_task_weights, device, normalized = False):
                         break
     return orth_loss
 
-
 def train(model, dataloader, optimizer, scheduler, lambda1, past_task_weights, accelerator, normalized):
-
     model.train()
     train_loss, train_orth_loss = 0.0, 0.0
+
     for batch in dataloader:
         optimizer.zero_grad()
-        _, _ = batch.pop('generation_text'), batch.pop('generation_text_attn_mask')
+
+        # Print batch keys to debug
+        print(f"Batch keys: {batch.keys()}")
+
+        # Check if 'generation_text' exists before popping
+        if 'generation_text' in batch and 'generation_text_attn_mask' in batch:
+            _, _ = batch.pop('generation_text'), batch.pop('generation_text_attn_mask')
+        else:
+            print("Error: 'generation_text' is missing from the batch")
+            print(f"Available keys: {batch.keys()}")
+            raise KeyError("'generation_text' or 'generation_text_attn_mask' missing from batch")
+
         batch = {k:v.to(accelerator.device) for k,v in batch.items()}
         labels = batch.pop('labels')
-        out = model(**batch) 
+        out = model(**batch)
         logits = out.logits
-        # print(logits.shape[-1])
+
         orth_loss = orthogonal_lora_loss(model, past_task_weights, accelerator.device, normalized)
         ce_loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1))
-        # print(orth_loss, ce_loss)
         loss = ce_loss + lambda1 * orth_loss
+
         accelerator.backward(loss)
         optimizer.step()
         scheduler.step()
-        train_loss = train_loss + ce_loss.item()
-        train_orth_loss = train_orth_loss + orth_loss.item()
-        # break
 
-    train_loss = train_loss / len(dataloader)
-    train_orth_loss = train_orth_loss / len(dataloader)
+        train_loss += ce_loss.item()
+        train_orth_loss += orth_loss.item()
 
-    return train_loss, train_orth_loss
-    
+    return train_loss / len(dataloader), train_orth_loss / len(dataloader)
+
 
 def validate(model, dataloader, rouge_score, device):
     model.eval()
@@ -140,8 +147,8 @@ if __name__ == '__main__':
         if accelerator.is_main_process:
             logger.info("Preparing the %s dataset for joint training."%task)
         trainset, testset = GET_DATASET[task]()
-        sequential_train_data[task] = preprocess_dataset_list(trainset, tokenizer)
-        sequential_valid_data[task] = preprocess_dataset_list(testset, tokenizer)
+        sequential_train_data[task] = preprocess_dataset_list(trainset, tokenizer, model_name=args.model_name)
+        sequential_valid_data[task] = preprocess_dataset_list(testset, tokenizer, model_name=args.model_name)
 
     # Preparing dataloaders for training and evaluation
     data_collator = CustomCollatorwithLabelPadding(tokenizer=tokenizer)
@@ -153,6 +160,7 @@ if __name__ == '__main__':
 
     all_rouge_score_stats = {}
     olora_past_A_matrices = {}
+    olora_past_B_matrices = {}
     for i, (train_task_name, train_dataloader) in enumerate(train_dataloaders.items()):
         if accelerator.is_main_process:
             logger.info("===============================================================================")
@@ -229,7 +237,8 @@ if __name__ == '__main__':
         # Saving the LoRA_A adapters of the current task
         for param in model.parameters():
             param.requires_grad = False
-        olora_past_A_matrices[train_task_name] = { k: param.to('cpu') for k, param in model.named_parameters() if 'lora_A' in k }
+        olora_past_A_matrices[train_task_name] = { k: param.to('cpu') for k, param in model.named_parameters() if 'lora_A' in k}
+        olora_past_B_matrices[train_task_name] = { k: param.to('cpu') for k, param in model.named_parameters() if 'lora_B' in k}
         # Merging the current task LoRA layers to the model and removing the lora components.
         model = model.merge_and_unload()
         # for name,param in model.named_parameters():
@@ -253,3 +262,4 @@ if __name__ == '__main__':
         pickle.dump(all_rouge_score_stats, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     torch.save(olora_past_A_matrices, os.path.join(args.experiment_dir,'olora_adapters.pt'))
+    torch.save(olora_past_B_matrices, os.path.join(args.experiment_dir, 'olora_B_adapters.pt'))
