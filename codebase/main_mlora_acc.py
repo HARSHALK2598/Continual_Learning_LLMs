@@ -42,17 +42,22 @@ def orthogonal_lora_loss(model, past_task_weights_A, past_task_weights_B, device
 
     # Store current model's LoRA A and B matrices
     model_lora_A = {name: param for name, param in model.named_parameters() if "lora_A" in name}
-    model_lora_B = {name.replace("lora_A", "lora_B"): param for name in model_lora_A.keys()}
-
+    # Corrected way to get LoRA B matrices
+    model_lora_B = {
+        name.replace("lora_A", "lora_B"): model.state_dict()[name.replace("lora_A", "lora_B")]
+        for name in model_lora_A.keys()
+        if name.replace("lora_A", "lora_B") in model.state_dict()
+    }
     for layer_name in model_lora_A.keys():
         if layer_name in model_lora_B:
             # Retrieve current model's A and B matrices
             current_A = model_lora_A[layer_name]
             current_B = model_lora_B[layer_name]
+            
+
 
             # Compute AB for the current model
-            current_AB = torch.mm(current_A, current_B)
-
+            current_AB = torch.mm(current_A.T, current_B.T)
             # Check if past task weights exist for this layer
             for task_name in past_task_weights_A.keys():
                 if layer_name in past_task_weights_A[task_name] and layer_name in past_task_weights_B[task_name]:
@@ -61,8 +66,8 @@ def orthogonal_lora_loss(model, past_task_weights_A, past_task_weights_B, device
                     saved_B = past_task_weights_B[task_name][layer_name].to(device)
 
                     # Compute AB for the past task
-                    saved_AB = torch.mm(saved_A, saved_B)
-
+                    saved_AB = torch.mm(saved_A.T, saved_B.T)
+                    
                     # Normalize AB matrices based on the chosen method
                     if normalization_type == "column":
                         saved_AB_norm = saved_AB / torch.norm(saved_AB, dim=0, p=2, keepdim=True)
@@ -74,6 +79,7 @@ def orthogonal_lora_loss(model, past_task_weights_A, past_task_weights_B, device
                     # Compute dot product and accumulate loss
                     term = torch.abs(torch.dot(saved_AB_norm.view(-1), current_AB_norm.view(-1))).sum()
                     orth_loss += term
+        break
 
     return orth_loss
 
@@ -85,8 +91,6 @@ def train(model, dataloader, optimizer, scheduler, lambda1, past_task_weights_A,
     for batch in dataloader:
         optimizer.zero_grad()
 
-        # Print batch keys to debug
-        print(f"Batch keys: {batch.keys()}")
 
         # Check if 'generation_text' exists before popping
         if 'generation_text' in batch and 'generation_text_attn_mask' in batch:
@@ -178,8 +182,8 @@ if __name__ == '__main__':
         if accelerator.is_main_process:
             logger.info("Preparing the %s dataset for joint training."%task)
         trainset, testset = GET_DATASET[task]()
-        sequential_train_data[task] = preprocess_dataset_list(trainset, tokenizer, model_name=args.model_name)
-        sequential_valid_data[task] = preprocess_dataset_list(testset, tokenizer, model_name=args.model_name)
+        sequential_train_data[task] = preprocess_dataset_list(trainset, tokenizer)
+        sequential_valid_data[task] = preprocess_dataset_list(testset, tokenizer)
 
     # Preparing dataloaders for training and evaluation
     data_collator = CustomCollatorwithLabelPadding(tokenizer=tokenizer)
@@ -216,7 +220,7 @@ if __name__ == '__main__':
             logger.info("Listing the trainable layers:")
             for name, param in model.named_parameters():
                 if param.requires_grad:
-                    print(name)
+                    #print(name)
                     logger.info(name)
 
         num_update_steps_per_epoch = len(train_dataloader)
